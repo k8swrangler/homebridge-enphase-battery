@@ -38,20 +38,30 @@ let hap: HAP;
  */
 export = (api: API) => {
   hap = api.hap;
-  api.registerAccessory('EnphaseBatteryHomebridgePlugin', EnphaseBattery);
+  api.registerAccessory('EnphaseBatteryGridControlHomebridgePlugin', EnphaseBatteryGridControl);
 };
 
 // Request URL: https://enlighten.enphaseenergy.com/pv/systems/3419276/today
 
-class EnphaseBattery implements AccessoryPlugin {
+const authPArams = new URLSearchParams();
+authPArams.append('redirect_uri', 'https://api.enphaseenergy.com/oauth/redirect_uri');
+
+class EnphaseBatteryGridControl implements AccessoryPlugin {
 
   private readonly log: Logging;
   private readonly config: AccessoryConfig;
   private readonly name: string;
   private readonly siteId: string;
-
+  private readonly gridChargingTime: string;
+  private readonly APIKey: string;
+  private readonly authURL: string;
+  private readonly authCode: string;
+  private readonly clientId: string;
+  private readonly clientSecret: string;
   private readonly batteryService: Service;
   private readonly informationService: Service;
+  private authToken: string;
+  private authRefreshToken: string;
 
   private cookie;
 
@@ -60,18 +70,24 @@ class EnphaseBattery implements AccessoryPlugin {
     this.config = config;
     this.name = config.name;
     this.siteId = config.siteId;
-    this.cookie = this.authenticate();
+    this.gridChargingTime = config.gridChargingTime;
+    this.APIKey = config.APIKey;
+    this.authURL = config.authURL;
+    this.authCode = config.authCode;
+    authPArams.append('code', `${encodeURIComponent(config.authCode)}`);
+    this.authenticate();
 
-    this.batteryService = new hap.Service.Switch(this.name + ' Boost Reserve');
+    this.clientId = config.clientId;
+    this.clientSecret = config.clientSecret;
+    this.siteId = config.siteId;
+
+    this.batteryService = new hap.Service.Switch(this.name + ' Grid Charging');
     this.batteryService.getCharacteristic(hap.Characteristic.On)
       .onGet(async () => {
-        const currentReserve = await this.getCurrentReserve();
-        return currentReserve >= 50;
+        return await this.getGridChargingStatus();
       })
       .onSet(async (state) => {
-        const boostEnabled = state as boolean;
-        const batteryReserve = boostEnabled ? config.boostedBatteryReserve : config.batteryReserve;
-        await this.setReserve(batteryReserve);
+        this.setGridChargingStatus;
       });
 
     this.informationService = new hap.Service.AccessoryInformation()
@@ -90,61 +106,80 @@ class EnphaseBattery implements AccessoryPlugin {
     ];
   }
 
+  // Users clientid, clientsecret, authcode, and authuri to get initial token and refresh token
+  async getToken(){
+    authPArams.append('grant_type', 'authorization_code');
+
+    return fetch('https://api.enphaseenergy.com/oauth/token', {
+      method: 'post',
+      body: authPArams,
+      headers: {'Authorization': `Basic ${Buffer.from(this.config.clientId+':'+this.config.clientSecret).toString('base64')}`},
+    });
+  }
+
+  async refreshToken(){
+    authPArams.append('grant_type', 'refresh_token');
+    authPArams.append('refresh_token', this.authRefreshToken);
+
+    return fetch('https://api.enphaseenergy.com/oauth/token', {
+      method: 'post',
+      body: authPArams,
+      headers: {'Authorization': `Basic ${Buffer.from(this.config.clientId+':'+this.config.clientSecret).toString('base64')}`},
+    });
+  }
+
+
+
+
   // https://enlighten.enphaseenergy.com/login/login
   async authenticate() {
-    return fetch('https://enlighten.enphaseenergy.com/login/login', {
-      method: 'post',
-      body: `user%5Bemail%5D=${encodeURIComponent(this.config.email)}&user%5Bpassword%5D=${encodeURIComponent(this.config.password)}`,
-      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-      redirect: 'manual',
+
+    //if bearer token is nil
+    if (this.authToken == ''){
+      const authResponse = await this.getToken()
+        .then(authResponse => authResponse.json)
+        .then(authResponse => {
+          this.authToken = authResponse.access_token;
+          this.authRefreshToken = authResponse.refresh_token;
+          return true;
+        })
+        .catch(error => {
+          console.error(error);
+        });
+    }
+
+    // bearer is not nil then do the thing and if that fails for token exired, then refresh token
+
+    return fetch(`https://api.enphaseenergy.com/api/v4/systems/{system_id}/summary?key=${encodeURIComponent(this.config.APIKey)}`, {
+      header: `Authorization: ${this.authToken}`,
     })
-      .then(res => res.headers)
-      .then(headers => headers.get('Set-Cookie'))
-      .then(cookies => cookies.split(','))
-      .then(cookies => cookies.flatMap(cookie => cookie.split(';')))
-      .then(cookies => cookies.find(cookie => cookie.includes('session')))
-      .then(cookie => cookie.trim());
-  }
-
-  // Request URL: https://enlighten.enphaseenergy.com/pv/settings/3419276/battery_config
-  async getCurrentReserve() {
-    try {
-      const cookie = await this.cookie;
-      const response = await fetch(`https://enlighten.enphaseenergy.com/pv/settings/${this.siteId}/battery_config`, {
-        method: 'get',
-        headers: {'Cookie': cookie},
+      .then()
+      .catch(error => {
+      // console.error(error); //Refresh token if error is status is not 200
       });
-      const json = await response.json();
-      const batteryBackupPercentage = json.battery_config.battery_backup_percentage;
-      this.log.debug(`CurrentReserve: ${this.siteId} ${this.name} at ${batteryBackupPercentage}`);
-      return batteryBackupPercentage;
-    } catch (error) {
-      this.log.error(`CurrentReserve error: ${error}, reconnect in 15s.`);
-      this.reconnect();
-    }
   }
 
-  // Request URL: https://enlighten.enphaseenergy.com/pv/settings/3419276/battery_config
-  async setReserve(batteryReserve: number) {
-    this.log.info(`SetReserve ${this.siteId} ${this.name} to ${batteryReserve}`);
-    try {
-      const cookie = await this.cookie;
-      const response = await fetch(`https://enlighten.enphaseenergy.com/pv/settings/${this.siteId}/battery_config`, {
-        method: 'put',
-        body: `battery_backup_percentage=${batteryReserve}`,
-        headers: {'Content-Type': 'application/x-www-form-urlencoded', 'Cookie': cookie},
-      });
-      const text = await response.text();
-      this.log.debug(`Reserve updated. Response: ${text}`);
-    } catch (error) {
-      this.log.error(`SetReserve error: ${error}, reconnect in 15s.`);
-      this.reconnect();
-    }
+
+  // GET /api/v4/systems/config/{system_id}/battery_settings
+  // {
+  //   "system_id": 1765,
+  //   "battery_mode": "Self - Consumption",
+  //   "reserve_soc": 95,
+  //   "energy_independence": "enabled",
+  //   "charge_from_grid": "disabled",
+  //   "battery_shutdown_level": 13
+  // }
+  async getGridChargingStatus() {
+
   }
 
-  reconnect() {
-    setTimeout(() => {
-      this.cookie = this.authenticate();
-    }, 15000);
+  // PUT /api/v4/systems/config/{system_id}/battery_settings
+  // {
+  // "battery_mode": "string",
+  // "reserve_soc": 0,
+  // "energy_independence": "string"
+  // }
+  async setGridChargingStatus() {
+
   }
 }

@@ -1,5 +1,5 @@
 {
-  "pluginAlias": "EnphaseBatteryHomebridgePlugin",
+  "pluginAlias": "EnphaseBatteryGridControlHomebridgePlugin",
   "pluginType": "accessory",
   "singular": true,
   "schema": {
